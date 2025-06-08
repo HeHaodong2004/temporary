@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""
+Maskable PPO for PathFindingEnvWithMap with SB3 v2.6.0 & sb3-contrib v2.6.0
+- Discrete actions
+- Dict observation {"vec_obs", "next_obs", "action_mask"}
+- Provides action_masks() interface
+- VecNormalize only normalizes "vec_obs" and "next_obs"
+- SubprocVecEnv for parallel sampling
+"""
+
+import numpy as np
+import gymnasium as gym
+from gymnasium import spaces
+from typing import Optional
+import heapq
+import matplotlib
+matplotlib.use('Agg')
+
+from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv, VecMonitor, VecNormalize
+from stable_baselines3.common.callbacks import EvalCallback, StopTrainingOnNoModelImprovement, CallbackList
+from sb3_contrib import MaskablePPO
+
+from domains_cc.footprint import createFootprint
+from domains_cc.map_generator import generate_random_map
+from domains_cc.worldCC import WorldCollisionChecker
+
+class PathFindingEnvWithMap(gym.Env):
+    metadata = {"render_modes": ["human"]}
+
+    def __init__(self,
+                 grid_size=(20,20),
+                 obstacle_prob=0.1,
+                 footprint_spec=None,
+                 max_steps=200,
+                 patch_size=5):
+        super().__init__()
+
+        # global map & collision checker
+        self.grid = generate_random_map(grid_size, obstacle_prob).astype(np.float32)
+        self.world_cc = WorldCollisionChecker(self.grid)
+
+        # robot footprint
+        if footprint_spec is None:
+            footprint_spec = dict(type="rectangle", width=0.5,
+                                  height=1.5, resolution=0.1)
+        self.footprint = createFootprint(
+            footprint_spec["type"],
+            dict(width=footprint_spec["width"],
+                 height=footprint_spec["height"],
+                 resolution=footprint_spec["resolution"])
+        )
+
+        # discrete actions (Δx, Δy, Δθ)
+        self.discrete_actions = [
+            np.array([ 0.5, 0.0,   0.0], np.float32),
+            np.array([-0.5, 0.0,   0.0], np.float32),
+            np.array([ 0.0, 0.5,   0.0], np.float32),
+            np.array([ 0.0,-0.5,   0.0], np.float32),
+            np.array([ 0.0, 0.0,  10.0], np.float32),
+            np.array([ 0.0, 0.0, -10.0], np.float32),
+        ]
+        self.action_space = spaces.Discrete(len(self.discrete_actions))
+
+        # observation: four goal features + four next-waypoint features + mask
+        self.observation_space = spaces.Dict({
+            "vec_obs":    spaces.Box(-1.0, 1.0, shape=(4,), dtype=np.float32),
+            "next_obs":   spaces.Box(-1.0, 1.0, shape=(4,), dtype=np.float32),
+            "action_mask": spaces.MultiBinary(len(self.discrete_actions)),
+        })
+
+        self.max_steps = max_steps
+        self.current_state = np.zeros(3, np.float32)
+        self.goal_state    = np.zeros(3, np.float32)
+        self.step_count    = 0
+
+    def reset(self, *, seed: Optional[int]=None, options=None):
+        if seed is not None:
+            np.random.seed(seed)
+
+        H, W = self.grid.shape
+        # sample valid start and goal
+        def sample_pose():
+            return np.array([
+                np.random.uniform(0, W),
+                np.random.uniform(0, H),
+                np.random.uniform(0, 360)
+            ], np.float32)
+
+        # ensure valid start
+        while True:
+            s = sample_pose()
+            if self.world_cc.isValid(self.footprint, s.reshape(1,3))[0]:
+                break
+        # ensure valid goal and sufficiently far
+        while True:
+            g = sample_pose()
+            if (self.world_cc.isValid(self.footprint, g.reshape(1,3))[0] and
+                np.linalg.norm(g[:2] - s[:2]) > 0.1):
+                break
+
+        self.current_state = s.copy()
+        self.goal_state    = g.copy()
+        self.step_count    = 0
+
+        obs, _ = self._get_obs()
+        return obs, {}
+
+    def _grid_pos(self, state):
+        return (int(state[0]), int(state[1]))
+
+    def _astar_path(self, start, goal):
+        start_c, goal_c = self._grid_pos(start), self._grid_pos(goal)
+        H, W = self.grid.shape
+
+        def heuristic(p):
+            return abs(p[0] - goal_c[0]) + abs(p[1] - goal_c[1])
+
+        open_set = [(heuristic(start_c), 0, start_c)]
+        came      = {}
+        g_score   = {start_c: 0}
+        visited   = set()
+
+        while open_set:
+            _, cost, cur = heapq.heappop(open_set)
+            if cur in visited:
+                continue
+            visited.add(cur)
+            if cur == goal_c:
+                break
+            for dx, dy in [(1,0),(-1,0),(0,1),(0,-1)]:
+                nb = (cur[0] + dx, cur[1] + dy)
+                if not (0 <= nb[0] < W and 0 <= nb[1] < H):
+                    continue
+                if self.grid[nb[1], nb[0]] > 0.5:
+                    continue
+                new_cost = cost + 1
+                if new_cost < g_score.get(nb, 1e9):
+                    came[nb] = cur
+                    g_score[nb] = new_cost
+                    heapq.heappush(open_set, (new_cost + heuristic(nb), new_cost, nb))
+
+        # reconstruct path
+        path = []
+        node = goal_c
+        while node != start_c and node in came:
+            path.append(node)
+            node = came[node]
+        if node == start_c:
+            path.append(start_c)
+        return list(reversed(path))
+
+    def _get_obs(self):
+        # 1) compute goal-relative vec_obs
+        H, W = self.grid.shape
+        dx = (self.goal_state[0] - self.current_state[0]) / W
+        dy = (self.goal_state[1] - self.current_state[1]) / H
+        err_goal = (self.goal_state[2] - self.current_state[2] + 180) % 360 - 180
+        sin_g = np.sin(np.deg2rad(err_goal))
+        cos_g = np.cos(np.deg2rad(err_goal))
+        vec_obs = np.array([dx, dy, sin_g, cos_g], dtype=np.float32)
+
+        # 2) compute next-waypoint-relative next_obs via A* path
+        path = self._astar_path(self.current_state, self.goal_state)
+        # choose next grid after current
+        if len(path) >= 2:
+            next_cell = path[1]
+        else:
+            # if no path or already at goal cell, treat next as goal
+            next_cell = self._grid_pos(self.goal_state)
+        cx, cy = int(self.current_state[0]), int(self.current_state[1])
+        nx, ny = next_cell
+        dx_n = (nx + 0.5 - self.current_state[0]) / W
+        dy_n = (ny + 0.5 - self.current_state[1]) / H
+        # approximate heading for next cell
+        theta_next = np.rad2deg(np.arctan2(ny - cy, nx - cx))
+        err_next = (theta_next - self.current_state[2] + 180) % 360 - 180
+        sin_n = np.sin(np.deg2rad(err_next))
+        cos_n = np.cos(np.deg2rad(err_next))
+        next_obs = np.array([dx_n, dy_n, sin_n, cos_n], dtype=np.float32)
+
+        # 3) compute action_mask
+        mask = np.array([
+            self.world_cc.isValidEdge(
+                self.footprint,
+                self.current_state.reshape(1,3),
+                (self.current_state + move).reshape(1,3)
+            )[0]
+            for move in self.discrete_actions
+        ], dtype=bool)
+
+        return {"vec_obs": vec_obs, "next_obs": next_obs, "action_mask": mask}, path
+
+    def step(self, action: int):
+        prev = self.current_state.copy()
+        self.current_state = prev + self.discrete_actions[action]
+        self.step_count += 1
+
+        # reward: decrease in A* path length
+        pd = len(self._astar_path(prev, self.goal_state))
+        nd = len(self._astar_path(self.current_state, self.goal_state))
+        reward = -0.1 + float(pd - nd)
+
+        # done check
+        d = np.linalg.norm(self.current_state[:2] - self.goal_state[:2])
+        err = (self.current_state[2] - self.goal_state[2] + 180) % 360 - 180
+        if d < 0.2 and abs(err) < 5:
+            obs, _ = self._get_obs()
+            return obs, 100.0, True, False, {"info": "reached_goal"}
+
+        done = self.step_count >= self.max_steps
+        obs, _ = self._get_obs()
+        return obs, reward, False, done, {}
+
+    def action_masks(self):
+        return self._get_obs()[0]["action_mask"]
+
+    def render(self):
+        from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=(6,6), dpi=100)
+        ax.imshow(self.grid, cmap='Greys', origin='lower',
+                  extent=(0,self.grid.shape[1],0,self.grid.shape[0]))
+        self.world_cc.addXYThetaToPlot(ax, self.footprint, self.current_state, computeValidity=True)
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_xlim(0, self.grid.shape[1]); ax.set_ylim(0, self.grid.shape[0])
+        ax.set_aspect('equal')
+
+        canvas = FigureCanvas(fig)
+        canvas.draw()
+        w, h = fig.canvas.get_width_height()
+        img = np.frombuffer(canvas.tostring_rgb(), dtype='uint8').reshape(h, w, 3)
+        plt.close(fig)
+        return img
+
+# Env factory
+def make_env():
+    return PathFindingEnvWithMap()
+
+if __name__ == "__main__":
+    def linear_schedule(init):
+        return lambda progress: init * progress
+
+    train_env = SubprocVecEnv([make_env] * 32)
+    train_env = VecMonitor(train_env)
+    train_env = VecNormalize(
+        train_env, norm_obs=True, norm_reward=True,
+        clip_obs=10.0, norm_obs_keys=["vec_obs", "next_obs"]
+    )
+
+    eval_env = DummyVecEnv([make_env])
+    eval_env = VecMonitor(eval_env)
+    eval_env = VecNormalize(
+        eval_env, training=False, norm_obs=True, norm_reward=True,
+        clip_obs=10.0, norm_obs_keys=["vec_obs", "next_obs"]
+    )
+
+    early_stop = StopTrainingOnNoModelImprovement(
+        max_no_improvement_evals=10, min_evals=5, verbose=1
+    )
+    eval_callback = EvalCallback(
+        eval_env,
+        best_model_save_path="./models/best_maskppo/",
+        log_path="./logs/eval/",
+        eval_freq=10000,
+        n_eval_episodes=5,
+        deterministic=True,
+        render=False,
+        verbose=1,
+        callback_on_new_best=early_stop
+    )
+    callbacks = CallbackList([eval_callback])
+
+    model = MaskablePPO(
+        policy="MultiInputPolicy",
+        env=train_env,
+        verbose=1,
+        batch_size=256,
+        learning_rate=linear_schedule(3e-4),
+        tensorboard_log="./tensorboard_logs/",
+        device="auto"
+    )
+    model.learn(total_timesteps=10_000_000, callback=callbacks)
+    model.save("maskableppo_pathfinder_final")
+    print("✅ Training complete, model saved to maskableppo_pathfinder_final.zip")
