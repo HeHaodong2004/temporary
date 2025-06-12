@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""
+Maskable PPO for PathFindingEnvWithMap with SB3 v2.6.0 & sb3-contrib v2.6.0
+
+- Discrete actions
+- Dict observation {"vec_obs", "next_obs", "action_mask", "prev_actions"}
+- Provides action_masks() interface
+- VecNormalize only normalizes "vec_obs" and "next_obs"
+- SubprocVecEnv for parallel sampling
+- Implements Action Chunking + Temporal Ensemble via external Wrapper
+"""
+
+import copy
+import numpy as np
+import gymnasium as gym
+from gymnasium import spaces
+from typing import Optional
+from collections import deque
+import matplotlib
+matplotlib.use('Agg')
+from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+import matplotlib.pyplot as plt
+import heapq
+
+from stable_baselines3.common.vec_env import (
+    SubprocVecEnv, DummyVecEnv, VecMonitor, VecNormalize
+)
+from stable_baselines3.common.callbacks import (
+    EvalCallback, StopTrainingOnNoModelImprovement, CallbackList
+)
+from sb3_contrib import MaskablePPO
+
+from domains_cc.footprint import createFootprint
+from domains_cc.map_generator import generate_random_map
+from domains_cc.worldCC import WorldCollisionChecker
+
+
+class PathFindingEnvWithMap(gym.Env):
+    metadata = {"render_modes": ["human"]}
+
+    def __init__(
+        self,
+        grid_size=(20,20),
+        obstacle_prob=0.1,
+        footprint_spec=None,
+        max_steps=300,
+        prev_action_len: int = 1
+    ):
+        super().__init__()
+        # map + collision checker
+        self.grid = generate_random_map(grid_size, obstacle_prob).astype(np.float32)
+        self.world_cc = WorldCollisionChecker(self.grid)
+        self.H, self.W = self.grid.shape
+
+        # robot footprint
+        if footprint_spec is None:
+            footprint_spec = dict(type="rectangle", width=0.5,
+                                  height=1.5, resolution=0.1)
+        self.footprint = createFootprint(
+            footprint_spec["type"],
+            dict(width=footprint_spec["width"],
+                 height=footprint_spec["height"],
+                 resolution=footprint_spec["resolution"])
+        )
+
+        # discrete actions: dx, dy, dtheta
+        self.discrete_actions = [
+            np.array([ 0.25,  0.0,   0.0], np.float32),
+            np.array([-0.25,  0.0,   0.0], np.float32),
+            np.array([ 0.0,   0.25,  0.0], np.float32),
+            np.array([ 0.0,  -0.25,  0.0], np.float32),
+            np.array([ 0.0,   0.0,   3.5], np.float32),
+            np.array([ 0.0,   0.0,  -3.5], np.float32),
+        ]
+        self.action_space = spaces.Discrete(len(self.discrete_actions))
+
+        # previous actions buffer length
+        self.prev_action_len = prev_action_len
+        self.prev_actions = deque(maxlen=self.prev_action_len)
+
+        # observation: goal vec + flow vec + action mask + prev_actions
+        self.observation_space = spaces.Dict({
+            "vec_obs":      spaces.Box(-1.0, 1.0, shape=(4,), dtype=np.float32),
+            "next_obs":     spaces.Box(-1.0, 1.0, shape=(4,), dtype=np.float32),
+            "action_mask":  spaces.MultiBinary(len(self.discrete_actions)),
+            "prev_actions": spaces.Box(
+                low=-1,
+                high=len(self.discrete_actions)-1,
+                shape=(self.prev_action_len,),
+                dtype=np.int64
+            ),
+        })
+
+        # episode limits
+        self.max_steps     = max_steps
+        self.current_state = np.zeros(3, np.float32)
+        self.goal_state    = np.zeros(3, np.float32)
+        self.step_count    = 0
+
+        # placeholders for maps
+        self.dist_map   = np.full((self.H, self.W), np.inf, np.float32)
+        self.flow_field = np.zeros((self.H, self.W, 2), np.float32)
+
+    def reset(self, *, seed: Optional[int]=None, options=None):
+        if seed is not None:
+            np.random.seed(seed)
+        # sample start & goal
+        def sample_pose():
+            return np.array([
+                np.random.uniform(0, self.W),
+                np.random.uniform(0, self.H),
+                np.random.uniform(0, 360)
+            ], np.float32)
+        # ensure valid start
+        while True:
+            s = sample_pose()
+            if self.world_cc.isValid(self.footprint, s.reshape(1,3))[0]: break
+        # ensure valid goal on grid center
+        while True:
+            gi = np.random.randint(0, self.H)
+            gj = np.random.randint(0, self.W)
+            theta = np.random.uniform(0, 360)
+            g = np.array([gj+0.5, gi+0.5, theta], np.float32)
+            if (self.world_cc.isValid(self.footprint, g.reshape(1,3))[0]
+                and np.linalg.norm(g[:2]-s[:2])>0.1): break
+
+        self.current_state = s.copy()
+        self.goal_state    = g.copy()
+        self.step_count    = 0
+
+        # compute maps
+        gi_idx = int(self.goal_state[1])
+        gj_idx = int(self.goal_state[0])
+        self.dist_map = self._bfs_distance(self.grid, gi_idx, gj_idx)
+        self.flow_field = self._build_flow_field(self.dist_map)
+
+        # init prev_actions
+        self.prev_actions.clear()
+        for _ in range(self.prev_action_len):
+            self.prev_actions.append(-1)
+
+        obs, _ = self._get_obs()
+        return obs, {}
+
+    @staticmethod
+    def _bfs_distance(grid: np.ndarray, gi: int, gj: int) -> np.ndarray:
+        """
+        计算从目标网格 (gi, gj) 到所有格子的曼哈顿距离。
+        这里 gi = 列索引 (x_int)，gj = 行索引 (y_int)。
+        """
+        H, W = grid.shape
+        INF = np.inf
+        # dist[row, col]
+        dist = np.full((H, W), INF, np.float32)
+        free = (grid < 0.5)  # 可通行格子为 True
+
+        # 把传入的 (gi, gj) 解包成 (col, row)
+        col_idx, row_idx = gi, gj
+
+        dq = deque()
+        # 首先检查目标格子是否可通行
+        if free[row_idx, col_idx]:
+            dist[row_idx, col_idx] = 0
+            dq.append((row_idx, col_idx))
+
+        # 四连通邻居：(行偏移, 列偏移)
+        neighs = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+
+        while dq:
+            r, c = dq.popleft()
+            for dr, dc in neighs:
+                nr, nc = r + dr, c + dc
+                # 保证在网格内、可通行且未访问过
+                if 0 <= nr < H and 0 <= nc < W and free[nr, nc] and dist[nr, nc] == INF:
+                    dist[nr, nc] = dist[r, c] + 1
+                    dq.append((nr, nc))
+
+        return dist
+
+
+    @staticmethod
+    def _build_flow_field(dist: np.ndarray) -> np.ndarray:
+        H, W = dist.shape
+        flow = np.zeros((H, W, 2), np.float32)
+        neighs = [(-1,0),(1,0),(0,-1),(0,1)]
+        for i in range(H):
+            for j in range(W):
+                d0 = dist[i,j]
+                if not np.isfinite(d0): continue
+                best, vec = d0, None
+                for di,dj in neighs:
+                    ni,nj = i+di, j+dj
+                    if 0<=ni<H and 0<=nj<W and dist[ni,nj]<best:
+                        best = dist[ni,nj]; vec=(dj,di)
+                if vec is not None:
+                    dx,dy = vec; norm = np.hypot(dx,dy)+1e-8
+                    flow[i,j,0] = dx/norm; flow[i,j,1] = dy/norm
+        return flow
+
+    def _grid_pos(self, state):
+        return int(state[0]), int(state[1])
+
+    def _get_obs(self):
+        # goal vec
+        dx = (self.goal_state[0]-self.current_state[0])/self.W
+        dy = (self.goal_state[1]-self.current_state[1])/self.H
+        err = (self.goal_state[2]-self.current_state[2]+180)%360-180
+        sin_g, cos_g = np.sin(np.deg2rad(err)), np.cos(np.deg2rad(err))
+        vec_obs = np.array([dx,dy,sin_g,cos_g], np.float32)
+        # flow vec
+        gi, gj = self._grid_pos(self.current_state)   # col, row
+        fx, fy = self.flow_field[gj, gi]              # row 再前，col 再后
+        angle = np.arctan2(fy, fx)
+        sin_n, cos_n = np.sin(angle), np.cos(angle)
+        next_obs = np.array([fx, fy, sin_n, cos_n], np.float32)
+        # mask
+        mask = np.array([
+            self.world_cc.isValidEdge(
+                self.footprint,
+                self.current_state.reshape(1,3),
+                (self.current_state+mv).reshape(1,3)
+            )[0]
+            for mv in self.discrete_actions
+        ], dtype=bool)
+        # prev_actions
+        prev_arr = np.array(self.prev_actions, dtype=np.int64)
+        return {"vec_obs": vec_obs,
+                "next_obs": next_obs,
+                "action_mask": mask,
+                "prev_actions": prev_arr}, None
+
+    def step(self, action: int):
+        prev = self.current_state.copy()
+        self.current_state = prev + self.discrete_actions[action]
+        self.step_count += 1
+        # reward: A* path length change
+        pd = len(self._astar_path(prev, self.goal_state))
+        nd = len(self._astar_path(self.current_state, self.goal_state))
+        reward = -0.1 + float(pd - nd)
+        # done check
+        d = np.linalg.norm(self.current_state[:2]-self.goal_state[:2])
+        err = (self.current_state[2]-self.goal_state[2]+180)%360-180
+        done = False; info = {}
+        if d<0.5 and abs(err)<10:
+            done = True; reward += 100.0; info["info"]="reached_goal"
+        elif self.step_count>=self.max_steps:
+            done = True
+        # update prev_actions buffer
+        self.prev_actions.append(action)
+        obs, _ = self._get_obs()
+        return obs, reward, done, False, info
+
+    def action_masks(self):
+        return self._get_obs()[0]["action_mask"]
+
+    def render(self, save_path="flow_field.png"):
+        fig, ax = plt.subplots(figsize=(6,6), dpi=100)
+        ax.imshow(self.grid, cmap='Greys', origin='lower',
+                  extent=(0, self.W, 0, self.H))
+        ys = np.arange(0, self.H)
+        xs = np.arange(0, self.W)
+        X, Y = np.meshgrid(xs + 0.5, ys + 0.5)  
+        U = self.flow_field[Y.astype(int),   X.astype(int),   0]
+        V = self.flow_field[Y.astype(int),   X.astype(int),   1]
+        ax.quiver(X, Y, U, V,
+                angles='xy', scale_units='xy', scale=1,
+                width=0.003, alpha=0.7)
+
+        self.world_cc.addXYThetaToPlot(ax, self.footprint,
+                                       self.current_state, True)
+        self.world_cc.addXYThetaToPlot(ax, self.footprint,
+                                       self.goal_state, True)
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_xlim(0, self.W); ax.set_ylim(0, self.H)
+
+
+    def _astar_path(self, start, goal):
+        start_c, goal_c = self._grid_pos(start), self._grid_pos(goal)
+        open_set = [(abs(start_c[0]-goal_c[0]) + abs(start_c[1]-goal_c[1]), 0, start_c)]
+        came, g_score, visited = {}, {start_c:0}, set()
+        while open_set:
+            _, cost, cur = heapq.heappop(open_set)
+            if cur in visited: continue
+            visited.add(cur)
+            if cur == goal_c: break
+            for dx, dy in [(1,0),(-1,0),(0,1),(0,-1)]:
+                nb = (cur[0]+dx, cur[1]+dy)
+                if not (0<=nb[1]<self.H and 0<=nb[0]<self.W): continue
+                if self.grid[nb[1], nb[0]]>0.5: continue
+                nc = cost+1
+                if nc<g_score.get(nb,1e9):
+                    came[nb]=cur; g_score[nb]=nc
+                    heapq.heappush(open_set,(nc+abs(nb[0]-goal_c[0])+abs(nb[1]-goal_c[1]),nc,nb))
+        path=[]; node=goal_c
+        while node!=start_c and node in came:
+            path.append(node); node=came[node]
+        if node==start_c: path.append(start_c)
+        return list(reversed(path))
+
+
+def make_env():
+    return PathFindingEnvWithMap(prev_action_len=4)
+
+        
+class ChunkTemporalWrapper(gym.Wrapper):
+    """Action Chunking + Multi-Step Prediction + Temporal Ensemble Wrapper"""
+    def __init__(self, env, model, chunk_size=5, ensemble_depth=4, m=0.5):
+        super().__init__(env)
+        self.model = model
+        self.chunk_size = chunk_size
+        self.ensemble_depth = ensemble_depth
+        self.m = m
+        self.chunks = deque(maxlen=ensemble_depth)
+        self.ptr = 0
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self.chunks.clear()
+        for _ in range(self.ensemble_depth):
+            self.chunks.append([0]*self.chunk_size)
+        self.ptr = 0
+        return obs, info
+
+    def step(self, action=None):
+        if self.ptr == 0:
+            # 真正的多步预测：在环境副本上滚动 k 步
+            pred_env = copy.deepcopy(self.env)
+            chunk_actions = []
+            obs_pred, _ = pred_env._get_obs()
+            for _ in range(self.chunk_size):
+                a, _ = self.model.predict(obs_pred, deterministic=True)
+                chunk_actions.append(int(a))
+                obs_pred, _, _, _, _ = pred_env.step(int(a))
+            self.chunks.appendleft(chunk_actions)
+
+        votes = {}
+        for idx, ch in enumerate(self.chunks):
+            a = ch[self.ptr]
+            w = np.exp(-self.m * idx)
+            votes[a] = votes.get(a, 0.0) + w
+        chosen = max(votes.items(), key=lambda x: x[1])[0]
+
+        obs, rew, done, term, info = self.env.step(chosen)
+        self.ptr = (self.ptr + 1) % self.chunk_size
+        return obs, rew, done, term, info
+
+
+if __name__ == "__main__":
+    # --- training ---
+    train_env = SubprocVecEnv([make_env]*32)
+    train_env = VecMonitor(train_env)
+    train_env = VecNormalize(
+        train_env, norm_obs=True, norm_reward=True,
+        clip_obs=10.0, norm_obs_keys=["vec_obs","next_obs"]
+    )
+    model = MaskablePPO(
+        policy="MultiInputPolicy",
+        env=train_env,
+        verbose=1,
+        batch_size=256,
+        learning_rate=3e-4,
+        tensorboard_log="./tensorboard_logs/",
+        device="auto"
+    )
+    # evaluation callback
+    eval_env = DummyVecEnv([make_env])
+    eval_env = VecMonitor(eval_env)
+    eval_env = VecNormalize(
+        eval_env, training=False, norm_obs=True,
+        norm_reward=True, clip_obs=10.0,
+        norm_obs_keys=["vec_obs","next_obs"]
+    )
+    early_stop = StopTrainingOnNoModelImprovement(
+        max_no_improvement_evals=10, min_evals=5, verbose=1
+    )
+    eval_cb = EvalCallback(
+        eval_env,
+        best_model_save_path="./models/best/",
+        log_path="./logs/eval/",
+        eval_freq=10000,
+        n_eval_episodes=5,
+        deterministic=True,
+        verbose=1,
+        callback_on_new_best=early_stop
+    )
+    model.learn(total_timesteps=10_000_000, callback=CallbackList([eval_cb]))
+    model.save("maskppo_pathfinder_final")
+    print("✅ Training complete.")
+
+    # --- evaluation with Action Chunking + Temporal Ensemble ---
+    eval_env0 = make_env()
+    wrapped = ChunkTemporalWrapper(eval_env0, model,
+                                   chunk_size=5,
+                                   ensemble_depth=4,
+                                   m=0.5)
+    obs, _ = wrapped.reset()
+    done = False
+    total_r = 0.0
+    while not done:
+        obs, r, done, term, info = wrapped.step()
+        total_r += r
+    print(f"Eval episodic reward: {total_r}")
