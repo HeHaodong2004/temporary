@@ -102,9 +102,8 @@ class PathFindingEnvWithMap(gym.Env):
             gj = np.random.randint(0, self.W)
             theta = np.random.uniform(0, 360)
             g = np.array([gj+0.5, gi+0.5, theta], np.float32)
-            if self.world_cc.isValid(self.footprint, g.reshape(1,3))[0] and \ 
-               np.linalg.norm(g[:2]-s[:2])>0.1:
-                break
+            if (self.world_cc.isValid(self.footprint, g.reshape(1,3))[0]
+                and np.linalg.norm(g[:2]-s[:2])>0.1): break
 
         self.current_state = s.copy()
         self.goal_state = g.copy()
