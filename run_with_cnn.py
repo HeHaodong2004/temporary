@@ -130,7 +130,7 @@ if __name__ == "__main__":
         activation_fn=nn.ReLU,
     )
 
-    model = MaskablePPO(
+    '''model = MaskablePPO(
         policy="MultiInputPolicy",
         env=train_env,
         policy_kwargs=policy_kwargs,
@@ -139,7 +139,21 @@ if __name__ == "__main__":
         learning_rate=3e-4,
         tensorboard_log="./tensorboard_logs/",
         device="auto",
+    )'''
+
+    initial_lr = 3e-4
+
+    model = MaskablePPO(
+        policy="MultiInputPolicy",
+        env=train_env,
+        verbose=1,
+        n_steps=4096,            
+        batch_size=256,          
+        learning_rate=lambda p: initial_lr * p, 
+        tensorboard_log="./tensorboard_logs/",
+        device="auto"
     )
+
 
     # --- evaluation callback ---
     eval_env = DummyVecEnv([make_env])
@@ -154,15 +168,15 @@ if __name__ == "__main__":
     )
     early_stop = StopTrainingOnNoModelImprovement(
         max_no_improvement_evals=10,
-        min_evals=5,
+        min_evals=15,
         verbose=1,
     )
     eval_cb = EvalCallback(
         eval_env,
         best_model_save_path="./models/best/",
         log_path="./logs/eval/",
-        eval_freq=10000,
-        n_eval_episodes=5,
+        eval_freq=40000,
+        n_eval_episodes=25,
         deterministic=True,
         verbose=1,
         callback_on_new_best=early_stop,
