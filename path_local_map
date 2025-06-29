@@ -1,0 +1,276 @@
+# domains_cc/path_env.py
+import heapq
+from collections import deque
+from typing import Optional
+
+import cv2
+import gymnasium as gym
+import numpy as np
+from gymnasium import spaces
+
+from domains_cc.footprint import createFootprint
+from domains_cc.map_generator import generate_random_map
+from domains_cc.worldCC import WorldCollisionChecker
+
+
+def _xy2rc(xytheta: np.ndarray) -> np.ndarray:
+    """[x,y,θ] → [y,x,θ]  (row, col, θ)"""
+    return np.stack([xytheta[..., 1], xytheta[..., 0], xytheta[..., 2]], axis=-1)
+
+
+class PathFindingEnvWithMap(gym.Env):
+    metadata = {"render_modes": ["human"]}
+
+    # ------------------------------- INIT ---------------------------------
+    def __init__(
+        self,
+        grid_size=(20, 20),
+        obstacle_prob=0.2,
+        footprint_spec=None,
+        max_steps=300,
+        prev_action_len: int = 5,
+        patch_size: int = 7,      # ⇐ 默认 7×7
+        scale: int = 4,
+    ):
+        super().__init__()
+        assert patch_size % 2 == 1, "patch_size must be odd"
+        self.patch_size = patch_size
+
+        # ---------- map & collision ----------
+        self.grid = generate_random_map(grid_size, obstacle_prob).astype(np.float32)
+        self.world_cc = WorldCollisionChecker(self.grid)
+        self.H, self.W = self.grid.shape
+
+        self.scale = scale   # hi-res distance map factor
+
+        # ---------- robot footprint ----------
+        if footprint_spec is None:
+            footprint_spec = dict(type="rectangle", width=0.5, height=1.5, resolution=0.1)
+        self.footprint = createFootprint(
+            footprint_spec["type"],
+            dict(width=footprint_spec["width"],
+                 height=footprint_spec["height"],
+                 resolution=footprint_spec["resolution"]),
+        )
+
+        # ---------- discrete actions ----------
+        self.discrete_actions = [
+            np.array([ 0.25,  0.0,   0.0], np.float32),
+            np.array([-0.25,  0.0,   0.0], np.float32),
+            np.array([ 0.0 ,  0.25,  0.0], np.float32),
+            np.array([ 0.0 , -0.25,  0.0], np.float32),
+            np.array([ 0.0 ,  0.0,   3.5], np.float32),
+            np.array([ 0.0 ,  0.0,  -3.5], np.float32),
+            np.array([ 0.0 ,  0.0,  30.0], np.float32),
+            np.array([ 0.0 ,  0.0, -30.0], np.float32),
+        ]
+        self.action_space = spaces.Discrete(len(self.discrete_actions))
+
+        # ---------- observation space ----------
+        self.prev_action_len = prev_action_len
+        self.prev_actions = deque(maxlen=prev_action_len)
+
+        self.observation_space = spaces.Dict(
+            {
+                "vec_obs":   spaces.Box(-1.0, 1.0, shape=(4,), dtype=np.float32),
+                "local_map": spaces.Box(0.0, 1.0,
+                                        shape=(1, patch_size, patch_size),
+                                        dtype=np.float32),
+                "heading":   spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32),
+                "action_mask":  spaces.MultiBinary(len(self.discrete_actions)),
+                "prev_actions": spaces.Box(
+                    low=-1, high=len(self.discrete_actions) - 1,
+                    shape=(prev_action_len,), dtype=np.int64),
+            }
+        )
+
+        # ---------- other states ----------
+        self.max_steps = max_steps
+        self.current_state = np.zeros(3, np.float32)   # [x,y,θ]
+        self.goal_state    = np.zeros(3, np.float32)
+        self.step_count = 0
+
+        self.dist_map  = np.full((self.H, self.W), np.inf, np.float32)
+        self.hires_dist = None
+        self.flow_field = np.zeros((self.H, self.W, 2), np.float32)
+
+    # ----------------------------- RESET ----------------------------------
+    def reset(self, *, seed: Optional[int] = None, options=None):
+        if seed is not None:
+            np.random.seed(seed)
+
+        # --- sample start / goal (valid) ---
+        def sample_pose():
+            return np.array([np.random.uniform(0, self.W),
+                             np.random.uniform(0, self.H),
+                             np.random.uniform(0, 360)], np.float32)
+
+        while True:
+            s = sample_pose()
+            if self.world_cc.isValid(self.footprint, _xy2rc(s)[None])[0]:
+                break
+        while True:
+            row = np.random.randint(0, self.H)
+            col = np.random.randint(0, self.W)
+            g = np.array([col + 0.5, row + 0.5, np.random.uniform(0, 360)], np.float32)
+            if (self.world_cc.isValid(self.footprint, _xy2rc(g)[None])[0]
+                and np.linalg.norm(g[:2] - s[:2]) > 0.1):
+                break
+
+        self.current_state, self.goal_state = s.copy(), g.copy()
+        self.step_count = 0
+
+        # --- coarse distance map ---
+        col_idx, row_idx = int(self.goal_state[0]), int(self.goal_state[1])
+        self.dist_map = self._bfs_distance(self.grid, col_idx, row_idx)
+        maxd = float(self.H + self.W)
+        self.dist_map = np.where(np.isfinite(self.dist_map), self.dist_map, maxd)
+
+        # hi-res distance (optional, not used for local_map)
+        self.hires_dist = cv2.resize(
+            self.dist_map, (self.W * self.scale, self.H * self.scale),
+            interpolation=cv2.INTER_LINEAR)
+
+        # history
+        self.flow_field.fill(0)
+        self.prev_actions.clear()
+        self.prev_actions.extend([-1] * self.prev_action_len)
+
+        return self._get_obs()
+
+    # --------------------------- HELPERS ----------------------------------
+    @staticmethod
+    def _bfs_distance(grid: np.ndarray, col_idx: int, row_idx: int) -> np.ndarray:
+        H, W = grid.shape
+        dist = np.full((H, W), np.inf, np.float32)
+        free = grid < 0.5
+        dq   = deque()
+        if free[row_idx, col_idx]:
+            dist[row_idx, col_idx] = 0
+            dq.append((row_idx, col_idx))
+
+        while dq:                               # ✅ 只在这里 pop
+            r, c = dq.popleft()
+            for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+                nr, nc = r+dr, c+dc
+                if (0 <= nr < H and 0 <= nc < W and free[nr, nc]
+                        and not np.isfinite(dist[nr, nc])):
+                    dist[nr, nc] = dist[r, c] + 1
+                    dq.append((nr, nc))          # 可以安全 push
+        return dist
+
+
+    def _local_map(self):
+        """Float-center crop from coarse dist_map -> (1,k,k), range 0~1"""
+        k, half = self.patch_size, self.patch_size // 2
+        maxd = float(self.H + self.W)
+
+        # constant padding
+        src = cv2.copyMakeBorder(self.dist_map.astype(np.float32),
+                                 half, half, half, half,
+                                 borderType=cv2.BORDER_CONSTANT,
+                                 value=maxd)
+
+        # OpenCV center uses (x, y)
+        center = (self.current_state[0] + half,
+                  self.current_state[1] + half)
+
+        patch = cv2.getRectSubPix(src, (k, k), center)
+        return patch[None, ...].astype(np.float32) 
+
+    # ------------------------- OBSERVATION -------------------------------
+    def _get_obs(self):
+        dx  = (self.goal_state[0] - self.current_state[0]) / self.W
+        dy  = (self.goal_state[1] - self.current_state[1]) / self.H
+        err = (self.goal_state[2] - self.current_state[2] + 180) % 360 - 180
+        vec_obs = np.array([dx, dy,
+                            np.sin(np.deg2rad(err)),
+                            np.cos(np.deg2rad(err))], np.float32)
+
+        mask = np.array([
+            self.world_cc.isValidEdge(
+                self.footprint,
+                _xy2rc(self.current_state)[None],
+                _xy2rc(self.current_state + mv)[None]
+            )[0] for mv in self.discrete_actions], dtype=bool)
+
+        heading = np.array([np.sin(np.deg2rad(self.current_state[2])),
+                            np.cos(np.deg2rad(self.current_state[2]))],
+                           np.float32)
+
+        obs = {
+            "vec_obs":     vec_obs,
+            "local_map":   self._local_map(),
+            "heading":     heading,
+            "action_mask": mask,
+            "prev_actions": np.array(self.prev_actions, dtype=np.int64)
+        }
+        return obs, {}
+
+    # --------------------------- STEP ------------------------------------
+    def step(self, action: int):
+        prev = self.current_state.copy()
+        self.current_state = prev + self.discrete_actions[action]
+        self.current_state[0] = np.clip(self.current_state[0], 0, self.W-1e-3)
+        self.current_state[1] = np.clip(self.current_state[1], 0, self.H-1e-3)
+        self.step_count += 1
+
+        pd = len(self._astar_path(prev, self.goal_state))
+        nd = len(self._astar_path(self.current_state, self.goal_state))
+        reward = -0.1 + float(pd - nd)
+
+        d   = np.linalg.norm(self.current_state[:2] - self.goal_state[:2])
+        err = (self.current_state[2] - self.goal_state[2] + 180) % 360 - 180
+        done = False
+        info = {}
+        if d < 0.7 and abs(err) < 15:
+            reward += 100.0
+            done = True
+            info["info"] = "reached_goal"
+        elif self.step_count >= self.max_steps:
+            done = True
+
+        self.prev_actions.append(action)
+        return (*self._get_obs(), reward, done, False, info)
+
+    # --------------------- OPTIONAL RENDER -------------------------------
+    def render(self):
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(6,6), dpi=100)
+        ax.imshow(self.grid, cmap="Greys", origin="lower",
+                  extent=(0, self.W, 0, self.H))
+        self.world_cc.addXYThetaToPlot(ax, self.footprint,
+                                       _xy2rc(self.current_state), True)
+        self.world_cc.addXYThetaToPlot(ax, self.footprint,
+                                       _xy2rc(self.goal_state), True)
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_xlim(0, self.W); ax.set_ylim(0, self.H)
+        return fig, ax
+
+    # --------------- A* util (unchanged) ---------------------------------
+    def _astar_path(self, start, goal):
+        s_rc, g_rc = self._grid_pos(start), self._grid_pos(goal)
+        open_set = [(abs(s_rc[0]-g_rc[0])+abs(s_rc[1]-g_rc[1]), 0, s_rc)]
+        came, g_score, vis = {}, {s_rc:0}, set()
+        while open_set:
+            _, cost, cur = heapq.heappop(open_set)
+            if cur in vis: continue
+            vis.add(cur)
+            if cur == g_rc: break
+            for dr, dc in [(1,0),(-1,0),(0,1),(0,-1)]:
+                nb = (cur[0]+dr, cur[1]+dc)
+                if not (0<=nb[0]<self.H and 0<=nb[1]<self.W): continue
+                if self.grid[nb[0],nb[1]] > 0.5: continue
+                nc = cost + 1
+                if nc < g_score.get(nb, 1e9):
+                    came[nb] = cur
+                    g_score[nb] = nc
+                    f = nc + abs(nb[0]-g_rc[0]) + abs(nb[1]-g_rc[1])
+                    heapq.heappush(open_set, (f, nc, nb))
+        path, node = [], g_rc
+        while node != s_rc and node in came:
+            path.append(node); node = came[node]
+        return path[::-1]
+
+    def _grid_pos(self, state):
+        return int(state[1]), int(state[0])  # (row,col)
